@@ -1,2 +1,15 @@
+# Virtual environment
+.venv/
+
+# Raw data
 data/raw/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Mac system files
 .DS_Store
+
+# Secrets
+.env
