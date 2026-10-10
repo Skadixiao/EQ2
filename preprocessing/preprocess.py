@@ -11,7 +11,7 @@ import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 RAW_DIR = BASE_DIR / "data" / "raw"
-OUT_DIR = BASE_DIR / "data" / "processed1"
+OUT_DIR = BASE_DIR / "data" / "processed"
 MTU_COL = "MTU (UTC)"
 CUTOFF = pd.Timestamp("2025-10-01", tz="Europe/Berlin").tz_convert("UTC")
 
