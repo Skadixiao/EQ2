@@ -1,0 +1,61 @@
+{
+  "forecast_definition": "At 10:30 Europe/Berlin on D, predict all prices for D+1",
+  "data_path": "/Users/skadi/Desktop/EQ2/data/processed/model_dataset.csv",
+  "n_rows": 23926,
+  "n_features": 29,
+  "split_by": "Europe/Berlin local delivery date",
+  "train_dates": [
+    "2023-01-08",
+    "2024-12-04"
+  ],
+  "validation_dates": [
+    "2024-12-05",
+    "2025-05-02"
+  ],
+  "test_dates": [
+    "2025-05-03",
+    "2025-09-30"
+  ],
+  "training_rows": 16727,
+  "validation_rows": 3575,
+  "test_rows": 3624,
+  "cv_folds": 3,
+  "search_iterations": 10,
+  "best_cv_mae_eur_mwh": 21.556,
+  "best_params": {
+    "subsample": 0.9,
+    "reg_lambda": 10,
+    "reg_alpha": 0,
+    "n_estimators": 250,
+    "min_child_weight": 1,
+    "max_depth": 3,
+    "learning_rate": 0.03,
+    "colsample_bytree": 0.9
+  },
+  "validation_metrics": {
+    "MAE_eur_mwh": 27.743,
+    "RMSE_eur_mwh": 45.349,
+    "R2": 0.4928
+  },
+  "test_metrics": {
+    "MAE_eur_mwh": 19.632,
+    "RMSE_eur_mwh": 29.174,
+    "R2": 0.6841
+  },
+  "test_last_week_naive_metrics": {
+    "MAE_eur_mwh": 26.842,
+    "RMSE_eur_mwh": 43.581,
+    "R2": 0.2951
+  },
+  "excluded_unverified_features": [
+    "day_ahead_load_forecast_mw",
+    "load_ramp_1h",
+    "load_daily_max",
+    "load_daily_mean",
+    "load_vs_daily_mean",
+    "load_change_24h"
+  ],
+  "publication_timestamp_warning": "Raw CSVs are not point-in-time snapshots. Verify historical availability and revisions before claiming a fully leakage-free live backtest.",
+  "xgboost_version": "3.2.0",
+  "sklearn_version": "1.9.1"
+}

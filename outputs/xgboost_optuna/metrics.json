@@ -1,0 +1,58 @@
+{
+  "forecast_scenario": "At 10:30 Europe/Berlin on D, predict D+1 delivery prices",
+  "market_timezone": "Europe/Berlin",
+  "n_rows": 23926,
+  "n_features": 29,
+  "train_dates": [
+    "2023-01-08",
+    "2024-12-04"
+  ],
+  "validation_dates": [
+    "2024-12-05",
+    "2025-05-02"
+  ],
+  "test_dates": [
+    "2025-05-03",
+    "2025-09-30"
+  ],
+  "train_rows": 16727,
+  "validation_rows": 3575,
+  "test_rows": 3624,
+  "optuna_trials": 30,
+  "cv_folds": 3,
+  "best_cv_mae_eur_mwh": 21.514,
+  "best_params": {
+    "n_estimators": 300,
+    "max_depth": 5,
+    "learning_rate": 0.02226223678447678,
+    "min_child_weight": 6,
+    "subsample": 0.7255207501834895,
+    "colsample_bytree": 0.8453847005258923,
+    "reg_alpha": 0.0006678900043975422,
+    "reg_lambda": 14.87858463532841
+  },
+  "validation_metrics": {
+    "MAE_eur_mwh": 26.782,
+    "RMSE_eur_mwh": 44.409,
+    "R2": 0.5136
+  },
+  "test_metrics": {
+    "MAE_eur_mwh": 19.712,
+    "RMSE_eur_mwh": 29.484,
+    "R2": 0.6774
+  },
+  "test_last_week_naive_metrics": {
+    "MAE_eur_mwh": 26.842,
+    "RMSE_eur_mwh": 43.581,
+    "R2": 0.2951
+  },
+  "unverified_excluded_features": [
+    "day_ahead_load_forecast_mw",
+    "load_ramp_1h",
+    "load_daily_max",
+    "load_daily_mean",
+    "load_vs_daily_mean",
+    "load_change_24h"
+  ],
+  "data_availability_caveat": "Dataset lacks historical publication/as-of timestamps for external forecasts and actuals; time splitting alone does not prove absence of leakage. Recheck rolling feature construction and publication revisions."
+}
