@@ -1,0 +1,30 @@
+feature,mean_abs_shap_eur_mwh,group,importance_pct
+price_lag_24h,17.639877,Price History,28.79705
+is_workday,5.847479,Other,9.545994
+gas_generation_lag_168h,4.3674555,Generation Mix,7.129859
+price_lag_168h,4.0963483,Price History,6.687278
+pumped_storage_generation_lag_168h,3.7252905,Generation Mix,6.0815268
+day_of_week,3.5587564,Calendar,5.8096604
+solar_forecast_lag_48h,3.4753852,Renewables,5.673557
+price_lag_72h,2.6235223,Price History,4.2828927
+price_rolling_mean_48h,2.1747875,Price History,3.5503347
+actual_load_rolling_mean_48h,1.6263472,Demand,2.6550074
+price_lag_48h,1.6065083,Price History,2.6226203
+oil_generation_lag_48h,1.3548992,Generation Mix,2.2118692
+wind_total_forecast_lag_48h,0.9688399,Renewables,1.5816284
+actual_load_lag_168h,0.94201034,Demand,1.5378294
+biomass_generation_lag_48h,0.80385244,Generation Mix,1.312287
+hour,0.7571865,Calendar,1.2361048
+price_rolling_std_48h,0.7502847,Price History,1.2248378
+actual_load_rolling_std_48h,0.7442086,Demand,1.2149185
+month,0.7297256,Calendar,1.1912751
+lignite_generation_lag_168h,0.6288071,Generation Mix,1.0265259
+pumped_storage_generation_lag_48h,0.4654317,Generation Mix,0.759816
+lignite_generation_lag_48h,0.39451125,Generation Mix,0.64403856
+hard_coal_generation_lag_168h,0.37031105,Generation Mix,0.60453176
+actual_load_lag_48h,0.3694842,Demand,0.6031819
+gas_generation_lag_48h,0.35503367,Generation Mix,0.5795915
+is_holiday,0.34028625,Calendar,0.5555164
+actual_load_lag_72h,0.24043973,Demand,0.3925172
+hard_coal_generation_lag_48h,0.2018554,Generation Mix,0.3295284
+is_weekend,0.09692123,Calendar,0.15822364
