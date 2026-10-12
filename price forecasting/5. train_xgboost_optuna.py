@@ -32,7 +32,7 @@ from xgboost import XGBRegressor
 
 
 # ------------------------------ Settings ----------------------------------
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = ROOT / "data" / "processed" / "model_dataset.csv"
 if not DATA_PATH.exists():
     DATA_PATH = ROOT / "model_dataset.csv"

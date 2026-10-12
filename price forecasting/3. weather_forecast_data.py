@@ -19,6 +19,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+BASE_DIR = Path(__file__).resolve().parents[1]
 API = "https://single-runs-api.open-meteo.com/v1/forecast"
 VARIABLES = ["temperature_2m", "wind_speed_100m", "shortwave_radiation", "cloud_cover"]
 # Representative sample points, not grid-weighted countrywide generation forecasts.
@@ -122,7 +123,10 @@ def main():
         parser.error("--end must be on or after --start")
 
     output = Path(args.out)
+    if not output.is_absolute():
+        output = BASE_DIR / output
     output.parent.mkdir(parents=True, exist_ok=True)
+    
     # Incremental output: interrupted multi-month downloads can be resumed.
     completed = set()
     if output.exists():

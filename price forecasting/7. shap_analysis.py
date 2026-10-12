@@ -12,7 +12,7 @@ import shap
 # 1. CONFIGURATION
 # ============================================================
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 MODEL_DIR = ROOT / "outputs" / "xgboost_optuna"
 

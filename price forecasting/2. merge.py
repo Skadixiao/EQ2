@@ -15,7 +15,7 @@ import pandas as pd
 import holidays
 
 
-DATA_DIR = Path(__file__).resolve().parent / "data" / "processed"
+DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "processed"
 MARKET_TZ = "Europe/Berlin"  # Change to your bidding zone if needed
 HOLIDAY_COUNTRY = "DE"       # Change to the corresponding country code
 USE_RENEWABLE_IN_MODEL = False  # True ONLY for forecasts available before auction
