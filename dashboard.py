@@ -1,4 +1,4 @@
-"""Energy Quant | DE-LU day-ahead price forecast and battery trading backtest.
+"""Energy Quant | XGBoost forecasting, SHAP explainability, BESS, backtesting.
 
 From EQ2 root:
     pip install -r dashboard_requirements.txt
@@ -10,6 +10,9 @@ Expects files produced by train_xgboost_optuna.py and bess/backtest.py:
     bess/results/daily_pnl.csv
 
 Also contains an explicitly labelled synthetic example mode.
+
+Optional: interactive SHAP via XGBoost native Tree SHAP (no shap package needed),
+using outputs/xgboost_optuna/xgboost_model.json + test_features_for_shap.csv.
 The dashboard READS existing outputs; it never runs the optimiser or refits ML.
 """
 
@@ -349,11 +352,218 @@ def summary_table(daily: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+# ---------------------- Forecast diagnostics & interpretability ----------------------
+@st.cache_data(show_spinner=False)
+def load_json(path_text: str, modified: float) -> dict:
+    with open(path_text, encoding="utf-8") as file:
+        return json.load(file)
+
+
+def optional_json(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        value = load_json(str(path), path.stat().st_mtime)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def figure_hourly_mae(frame: pd.DataFrame) -> go.Figure:
+    tmp = frame.copy()
+    tmp["hour_berlin"] = tmp[TIME].dt.tz_convert(MARKET_TZ).dt.hour
+    tmp["absolute_error"] = (tmp[FORECAST] - tmp[ACTUAL]).abs()
+    results = tmp.groupby("hour_berlin", as_index=False)["absolute_error"].mean()
+    fig = go.Figure(go.Bar(
+        x=results["hour_berlin"], y=results["absolute_error"],
+        marker_color=COLORS["xgb"], name="Hourly MAE",
+        hovertemplate="Berlin hour %{x:02d}:00<br>MAE %{y:.2f} €/MWh<extra></extra>",
+    ))
+    fig.update_xaxes(title_text="Delivery hour (Europe/Berlin)", dtick=2)
+    fig.update_yaxes(title_text="MAE (€/MWh)")
+    return style_figure(fig, 340)
+
+
+def figure_daily_mae(frame: pd.DataFrame) -> go.Figure:
+    tmp = frame.copy()
+    tmp["absolute_error"] = (tmp[FORECAST] - tmp[ACTUAL]).abs()
+    results = tmp.groupby("delivery_date", as_index=False)["absolute_error"].mean()
+    fig = go.Figure(go.Scatter(
+        x=results["delivery_date"].astype(str), y=results["absolute_error"],
+        name="Daily MAE", mode="lines", fill="tozeroy",
+        line=dict(color=COLORS["xgb"], width=2.5),
+        hovertemplate="%{x}<br>MAE %{y:.2f} €/MWh<extra></extra>",
+    ))
+    fig.update_xaxes(type="date", title_text="Berlin delivery date")
+    fig.update_yaxes(title_text="MAE (€/MWh)")
+    return style_figure(fig, 340)
+
+
+def figure_accuracy_comparison(metadata: dict) -> go.Figure | None:
+    rows = []
+    for key, label in (("validation_metrics", "Validation"),
+                       ("test_metrics", "Test · XGBoost"),
+                       ("test_last_week_naive_metrics", "Test · last-week price")):
+        item = metadata.get(key)
+        if not isinstance(item, dict):
+            continue
+        value = next((float(v) for k, v in item.items()
+                      if k.casefold() in ("mae", "mae_eur_mwh") and v is not None), None)
+        if value is not None and np.isfinite(value):
+            rows.append((label, value))
+    if not rows:
+        return None
+    fig = go.Figure(go.Bar(
+        x=[r[0] for r in rows], y=[r[1] for r in rows],
+        marker_color=[COLORS["oracle"], COLORS["xgb"], COLORS["rule"]][:len(rows)],
+        text=[f"{r[1]:.2f}" for r in rows], textposition="outside",
+    ))
+    fig.update_yaxes(title_text="MAE (€/MWh)")
+    return style_figure(fig, 325)
+
+
+def figure_optuna_trials(trials: pd.DataFrame) -> go.Figure | None:
+    if not {"number", "value"}.issubset(trials.columns):
+        return None
+    tmp = trials.copy()
+    tmp["number"] = pd.to_numeric(tmp["number"], errors="coerce")
+    tmp["value"] = pd.to_numeric(tmp["value"], errors="coerce")
+    if "state" in tmp.columns:
+        tmp = tmp[tmp["state"].astype(str).str.upper() == "COMPLETE"]
+    tmp = tmp.dropna(subset=["number", "value"]).sort_values("number")
+    if tmp.empty:
+        return None
+    tmp["best"] = tmp["value"].cummin()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=tmp["number"] + 1, y=tmp["value"], mode="markers", name="Trial CV MAE",
+        marker=dict(color=COLORS["rule"], size=7),
+    ))
+    fig.add_trace(go.Scatter(
+        x=tmp["number"] + 1, y=tmp["best"], mode="lines", name="Best so far",
+        line=dict(color=COLORS["xgb"], width=3),
+    ))
+    fig.update_xaxes(title_text="Optuna trial", dtick=max(1, len(tmp) // 15))
+    fig.update_yaxes(title_text="Training CV MAE (€/MWh)")
+    return style_figure(fig, 355)
+
+
+def png_gallery_paths(base: Path) -> list[Path]:
+    """Find arbitrary SHAP filenames nested inside the project's shap folder."""
+    choices = []
+    for sub in (base / "shap", base / "figures"):
+        if sub.is_dir():
+            choices.extend(sub.rglob("*.png"))
+            choices.extend(sub.rglob("*.jpg"))
+    # Handle e.g. outputs/xgboost_optuna/shap_beeswarm.png.
+    choices.extend(base.glob("*shap*.png"))
+    return sorted(set(choices), key=lambda p: str(p).casefold())
+
+
+@st.cache_data(show_spinner="Loading Tree SHAP values …")
+def compute_xgb_shap(model_file: str, model_mtime: float,
+                     feature_file: str, feature_mtime: float,
+                     schema_file: str, schema_mtime: float,
+                     max_rows: int = 4000) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Explain saved holdout examples via XGBoost's native exact Tree SHAP.
+
+    No recomputation of forecast predictions/fit. Sampling spans the full test
+    interval, deterministic with a hard row cap for responsive portfolio use.
+    """
+    import xgboost as xgb  # optional runtime package
+
+    with open(schema_file, encoding="utf-8") as file:
+        features = json.load(file)
+    if not isinstance(features, list) or not features or not all(isinstance(c, str) for c in features):
+        raise ValueError("feature_columns.json must be a list of feature names")
+    original = pd.read_csv(feature_file)
+    absent = [c for c in features if c not in original.columns]
+    if absent:
+        raise ValueError(f"SHAP features missing: {absent[:8]}")
+    if TIME not in original:
+        raise ValueError(f"{feature_file} needs a {TIME} column")
+    original[TIME] = pd.to_datetime(original[TIME], utc=True, errors="raise")
+    if original[TIME].duplicated().any():
+        raise ValueError("Duplicate UTC times in test_features_for_shap.csv")
+    original = original.sort_values(TIME).reset_index(drop=True)
+    if original.empty:
+        raise ValueError("test_features_for_shap.csv has no rows")
+    if len(original) > max_rows:
+        take = np.linspace(0, len(original) - 1, max_rows, dtype=int)
+        original = original.iloc[take].reset_index(drop=True)
+    x = original[features].apply(pd.to_numeric, errors="raise")
+    booster = xgb.Booster()
+    booster.load_model(model_file)
+    dmatrix = xgb.DMatrix(x, feature_names=features)
+    values = np.asarray(booster.predict(dmatrix, pred_contribs=True), dtype=float)
+    if values.ndim != 2 or values.shape[1] != len(features) + 1:
+        raise ValueError("Unexpected XGBoost SHAP contribution shape")
+    contributions = pd.DataFrame(values[:, :-1], columns=features)
+    contributions.insert(0, TIME, original[TIME].to_numpy())
+    contributions["delivery_date"] = original[TIME].dt.tz_convert(MARKET_TZ).dt.date
+    contributions["base_value_eur_mwh"] = values[:, -1]
+    contributions["model_prediction_eur_mwh"] = values.sum(axis=1)
+    summary = pd.DataFrame({
+        "Feature": features,
+        "Mean |SHAP| (€/MWh)": np.abs(values[:, :-1]).mean(axis=0),
+        "Mean SHAP (€/MWh)": values[:, :-1].mean(axis=0),
+    }).sort_values("Mean |SHAP| (€/MWh)", ascending=False).reset_index(drop=True)
+    return contributions, summary, {
+        "sample_rows": len(original), "available_rows": len(pd.read_csv(feature_file, usecols=[TIME])),
+        "feature_names": features,
+    }
+
+
+def figure_shap_importance(importance: pd.DataFrame, top_n: int = 15) -> go.Figure:
+    values = importance.head(top_n).iloc[::-1]
+    fig = go.Figure(go.Bar(
+        x=values["Mean |SHAP| (€/MWh)"], y=values["Feature"],
+        orientation="h", marker_color=COLORS["xgb"],
+        hovertemplate="%{y}<br>Mean |SHAP| %{x:.3f} €/MWh<extra></extra>",
+    ))
+    fig.update_xaxes(title_text="Mean absolute contribution (€/MWh)")
+    fig.update_yaxes(title_text="")
+    return style_figure(fig, max(360, 28 * len(values) + 90))
+
+
+def figure_shap_dependence(contrib: pd.DataFrame, feature: str,
+                           features: pd.DataFrame) -> go.Figure:
+    xdata = features[[TIME, feature]].copy()
+    xdata[TIME] = pd.to_datetime(xdata[TIME], utc=True)
+    subset = contrib[[TIME, feature]].merge(xdata, on=TIME, suffixes=("_shap", "_value"))
+    fig = go.Figure(go.Scattergl(
+        x=subset[f"{feature}_value"], y=subset[f"{feature}_shap"],
+        mode="markers", marker=dict(color=COLORS["xgb"], opacity=.5, size=6),
+        hovertemplate="Feature value: %{x:.3f}<br>Contribution: %{y:+.3f} €/MWh<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_dash="dash", line_color=COLORS["actual"])
+    fig.update_xaxes(title_text=f"{feature} (original feature units)")
+    fig.update_yaxes(title_text="SHAP contribution to forecast (€/MWh)")
+    return style_figure(fig, 380)
+
+
+def figure_shap_one_hour(row: pd.Series, feature_names: list[str], limit: int = 12) -> go.Figure:
+    values = pd.Series({f: float(row[f]) for f in feature_names}).sort_values(key=abs, ascending=False)
+    shown = values.iloc[:limit]
+    if len(values) > limit:
+        shown = pd.concat([shown, pd.Series({"Other features": values.iloc[limit:].sum()})])
+    shown = shown.iloc[::-1]
+    fig = go.Figure(go.Bar(
+        y=shown.index.tolist(), x=shown.to_numpy(), orientation="h",
+        marker_color=[COLORS["xgb"] if v >= 0 else COLORS["negative"] for v in shown],
+        hovertemplate="%{y}<br>%{x:+.3f} €/MWh<extra></extra>",
+    ))
+    fig.add_vline(x=0, line_color=COLORS["actual"], line_width=1)
+    fig.update_xaxes(title_text="Contribution relative to model base value (€/MWh)")
+    return style_figure(fig, max(390, 27 * len(shown) + 90))
+
+
 # ---------------------- Data sources and date range ----------------------
 project_prediction = first_existing(
     ROOT / "outputs" / "xgboost_optuna" / "test_predictions.csv",
     ROOT / "outputs" / "xgboost" / "test_predictions.csv",
 )
+project_model_dir = project_prediction.parent
 project_hourly = ROOT / "bess" / "results" / "hourly_dispatch.csv"
 project_daily = ROOT / "bess" / "results" / "daily_pnl.csv"
 project_ready = project_hourly.is_file() and project_daily.is_file()
@@ -445,7 +655,7 @@ uplift = xgb_total - rule_total
 capture = (xgb_total / oracle_total * 100.0) if oracle_total > 0 else float("nan")
 forecast_m = forecast_stats(view_prediction)
 
-st.markdown("# From price forecasts to realised BESS P&L")
+st.markdown("# Forecast → Explain → Optimise → Backtest")
 st.markdown(
     "<div class='subline'>Germany–Luxembourg (DE-LU) day-ahead market &nbsp;·&nbsp; "
     "Hourly holdout &nbsp;·&nbsp; Forecast-based MILP dispatch &nbsp;·&nbsp; "
@@ -459,16 +669,19 @@ else:
     st.info("**Historical simulation, not live trading.** Execution, trading fees, "
             "liquidity and point-in-time data availability are not fully modelled.", icon="ℹ️")
 
-flow1, flow2, flow3 = st.columns(3, gap="small")
+flow1, flow2, flow3, flow4 = st.columns(4, gap="small")
 with flow1:
     st.markdown("<div class='flow'><strong>01 / Forecast</strong>"
                 "<p>XGBoost day-ahead €/MWh</p></div>", unsafe_allow_html=True)
 with flow2:
-    st.markdown("<div class='flow'><strong>02 / Optimise</strong>"
-                "<p>MILP charging / discharging</p></div>", unsafe_allow_html=True)
+    st.markdown("<div class='flow'><strong>02 / Explain</strong>"
+                "<p>Tree SHAP market drivers</p></div>", unsafe_allow_html=True)
 with flow3:
-    st.markdown("<div class='flow'><strong>03 / Settle & evaluate</strong>"
-                "<p>Real prices → P&L vs benchmark</p></div>", unsafe_allow_html=True)
+    st.markdown("<div class='flow'><strong>03 / Optimise</strong>"
+                "<p>MILP battery scheduling</p></div>", unsafe_allow_html=True)
+with flow4:
+    st.markdown("<div class='flow'><strong>04 / Backtest</strong>"
+                "<p>Real prices → P&L / risk</p></div>", unsafe_allow_html=True)
 
 st.write("")
 k1, k2, k3, k4 = st.columns(4, gap="small")
@@ -486,9 +699,10 @@ st.caption(f"Selected: **{len(view_daily)} complete delivery days** · "
            f"**{len(view_prediction):,} forecast rows**. "
            "All P&L shown is backtested simulation, not executed trades.")
 
-overview, forecasting, dispatch, pnl_tab, methods = st.tabs([
-    "01  Overview", "02  Price forecast", "03  Battery dispatch",
-    "04  P&L & risk", "05  Methodology",
+overview, forecasting, shap_tab, training_tab, dispatch, pnl_tab, methods = st.tabs([
+    "01  Overview", "02  Forecast performance", "03  SHAP drivers",
+    "04  Model training", "05  Battery dispatch", "06  P&L & risk",
+    "07  Methodology",
 ])
 
 with overview:
@@ -546,7 +760,7 @@ with forecasting:
     st.caption("Tail thresholds are computed **after the fact** from the selected sample. "
                "They diagnose performance, but are never used to choose a trading schedule.")
 
-    metrics_path = ROOT / "outputs" / "xgboost_optuna" / "metrics.json"
+    metrics_path = project_model_dir / "metrics.json"
     with st.expander("Optional model training metadata"):
         if source == "Project files" and metrics_path.is_file():
             try:
@@ -563,6 +777,215 @@ with forecasting:
                 st.warning(f"Could not read model metrics: {exc}")
         else:
             st.caption("Optional: place `metrics.json` next to your XGBoost predictions.")
+
+    st.markdown("#### Forecast errors through time")
+    f_left, f_right = st.columns(2, gap="large")
+    with f_left:
+        st.plotly_chart(figure_daily_mae(view_prediction), use_container_width=True)
+    with f_right:
+        st.plotly_chart(figure_hourly_mae(view_prediction), use_container_width=True)
+
+    st.markdown("#### Largest forecast misses in the selected backtest window")
+    biggest = view_prediction[[TIME, "delivery_date", ACTUAL, FORECAST]].copy()
+    biggest["Error (€/MWh)"] = biggest[FORECAST] - biggest[ACTUAL]
+    biggest["Absolute error (€/MWh)"] = biggest["Error (€/MWh)"].abs()
+    biggest["Berlin time"] = biggest[TIME].dt.tz_convert(MARKET_TZ).dt.strftime("%Y-%m-%d %H:%M %Z")
+    biggest = biggest.sort_values("Absolute error (€/MWh)", ascending=False).head(20)
+    st.dataframe(biggest[["Berlin time", ACTUAL, FORECAST, "Error (€/MWh)",
+                          "Absolute error (€/MWh)"]], hide_index=True, use_container_width=True)
+
+    if source == "Project files":
+        fig_files = sorted((project_model_dir / "figures").glob("*.png")) if (project_model_dir / "figures").is_dir() else []
+        if fig_files:
+            with st.expander(f"Open saved forecast analysis figures ({len(fig_files)})"):
+                chosen_forecast_fig = st.selectbox("Figure", fig_files, format_func=lambda p: p.stem.replace("_", " "))
+                st.image(str(chosen_forecast_fig), caption=chosen_forecast_fig.name, use_container_width=True)
+
+with shap_tab:
+    st.subheader("What drives the XGBoost price forecast?")
+    st.caption("SHAP decomposes the model's *predicted price* into a model baseline "
+               "and contributions from input features. It does not establish "
+               "causal drivers of the actual electricity market.")
+
+    if source == "Project files":
+        model_file = project_model_dir / "xgboost_model.json"
+        schema_file = project_model_dir / "feature_columns.json"
+        feature_file = project_model_dir / "test_features_for_shap.csv"
+        images = [p for p in png_gallery_paths(project_model_dir)
+                  if ("shap" in str(p.relative_to(project_model_dir)).lower())]
+        ready_for_shap = all(p.is_file() for p in (model_file, schema_file, feature_file))
+        if ready_for_shap:
+            try:
+                shap_rows, shap_importance, shap_info = compute_xgb_shap(
+                    str(model_file), model_file.stat().st_mtime,
+                    str(feature_file), feature_file.stat().st_mtime,
+                    str(schema_file), schema_file.stat().st_mtime,
+                )
+                shap_rows = shap_rows[(shap_rows["delivery_date"] >= start) &
+                                      (shap_rows["delivery_date"] <= end)].copy()
+                # Compute importance for only the selected time window.
+                feature_names = shap_info["feature_names"]
+                if not shap_rows.empty:
+                    matched = shap_rows[[TIME, "model_prediction_eur_mwh"]].merge(
+                        prediction[[TIME, FORECAST]], on=TIME, how="inner")
+                    if not matched.empty:
+                        forecast_difference = (
+                            matched["model_prediction_eur_mwh"] - matched[FORECAST]
+                        ).abs()
+                        if float(forecast_difference.max()) > 0.10:
+                            st.warning(
+                                f"SHAP model differs from test_predictions.csv "
+                                f"(maximum difference: {forecast_difference.max():.2f} €/MWh). "
+                                "Feature explanations below belong to the saved model, "
+                                "which may not match the model used by the backtest."
+                            )
+                    scoped_imp = pd.DataFrame({
+                        "Feature": feature_names,
+                        "Mean |SHAP| (€/MWh)": shap_rows[feature_names].abs().mean().values,
+                        "Mean SHAP (€/MWh)": shap_rows[feature_names].mean().values,
+                    }).sort_values("Mean |SHAP| (€/MWh)", ascending=False)
+                    st.caption(f"Computed with the **saved XGBoost model** and held-out features: "
+                               f"{len(shap_rows):,} observations in selected window "
+                               f"({shap_info['sample_rows']:,} sampled out of "
+                               f"{shap_info['available_rows']:,} held-out rows overall).")
+                    sc1, sc2 = st.columns([1.1, .9], gap="large")
+                    with sc1:
+                        st.markdown("#### Global SHAP importance")
+                        top_k = st.slider("Top features", 1, min(25, len(scoped_imp)),
+                                          min(15, len(scoped_imp)), key="shap_feature_count")
+                        st.plotly_chart(figure_shap_importance(scoped_imp, top_k), use_container_width=True)
+                    with sc2:
+                        st.markdown("#### How to interpret")
+                        st.markdown(
+                            "**Mean |SHAP|:** average magnitude of impact on the model "
+                            "prediction in €/MWh.\n\n"
+                            "**Positive SHAP:** pushes the predicted price up.\n\n"
+                            "**Negative SHAP:** pushes it down.\n\n"
+                            "Correlated features complicate interpretation; "
+                            "SHAP is not evidence of market causality."
+                        )
+                        st.dataframe(scoped_imp.head(12).round(3), hide_index=True,
+                                     use_container_width=True)
+                        st.download_button("Download SHAP importance",
+                            scoped_imp.to_csv(index=False).encode("utf-8"),
+                            "shap_importance_selected_window.csv", mime="text/csv")
+
+                    st.markdown("#### Individual feature response")
+                    feature_choice = st.selectbox("Feature to explore", scoped_imp["Feature"].tolist(), key="shap_feature")
+                    raw_features = read_csv(feature_file)
+                    st.plotly_chart(figure_shap_dependence(shap_rows, feature_choice, raw_features),
+                                    use_container_width=True)
+                    st.caption("X: observed feature value in held-out sample. Y: contribution "
+                               "to the **forecast**, not to the actual market price.")
+
+                    st.markdown("#### Explain an individual hourly forecast")
+                    shap_rows = shap_rows.sort_values(TIME)
+                    explain_timestamps = shap_rows[TIME].tolist()
+                    target_hour = st.selectbox(
+                        "Hour (UTC)", explain_timestamps,
+                        index=len(explain_timestamps) - 1,
+                        format_func=lambda t: pd.Timestamp(t).tz_convert(MARKET_TZ).strftime("%d %b %Y %H:%M %Z"),
+                        key="shap_timestamp")
+                    example = shap_rows[shap_rows[TIME] == target_hour].iloc[0]
+                    matching = prediction.loc[prediction[TIME] == target_hour, FORECAST]
+                    baseline = float(example["base_value_eur_mwh"])
+                    pred_native = float(example["model_prediction_eur_mwh"])
+                    cl1, cl2, cl3 = st.columns(3)
+                    cl1.metric("SHAP model baseline", f"{baseline:.2f} €/MWh")
+                    cl2.metric("Reconstructed prediction", f"{pred_native:.2f} €/MWh")
+                    cl3.metric("Saved forecast", f"{float(matching.iloc[0]):.2f} €/MWh" if len(matching) else "n/a")
+                    if len(matching) and abs(pred_native - float(matching.iloc[0])) > 0.10:
+                        st.warning("Saved forecasts differ from current model predictions "
+                                   "(>€0.10/MWh). Check that the XGBoost model and "
+                                   "test_features_for_shap.csv correspond to test_predictions.csv.")
+                    st.plotly_chart(figure_shap_one_hour(example, feature_names), use_container_width=True)
+                    st.caption("Base value + sum of ALL SHAP contributions equals the "
+                               "reconstructed model prediction (up to numerical precision). "
+                               "Small features are aggregated under Other features.")
+                else:
+                    st.info("No SHAP feature observations within the selected date range.")
+            except (OSError, ValueError, ImportError, RuntimeError, KeyError, TypeError) as exc:
+                st.warning(f"Interactive SHAP unavailable: {exc}")
+                st.caption("You can still view saved SHAP PNG figures below.")
+        else:
+            missing = [p.name for p in (model_file, schema_file, feature_file) if not p.is_file()]
+            st.info("Interactive SHAP needs: " + ", ".join(missing) +
+                    ". Saved SHAP figures can still be displayed below.")
+        if images:
+            st.markdown("#### Saved SHAP analysis figures")
+            options = sorted(images, key=lambda p: p.name.casefold())
+            chosen = st.selectbox("Saved SHAP figure", options,
+                                  format_func=lambda p: p.relative_to(project_model_dir).as_posix(),
+                                  key="saved_shap_image")
+            st.image(str(chosen), caption=chosen.relative_to(project_model_dir).as_posix(),
+                     use_container_width=True)
+            with st.expander(f"View all {len(images)} saved SHAP plots"):
+                group = st.columns(2)
+                for index, img in enumerate(options[:24]):
+                    with group[index % 2]:
+                        st.image(str(img), caption=img.name, use_container_width=True)
+        elif not ready_for_shap:
+            st.caption("No SHAP PNGs found in `outputs/xgboost_optuna/shap/`. "
+                       "Once generated, they will be discovered automatically.")
+    else:
+        st.info("Synthetic example does not include a fitted XGBoost model or SHAP values. "
+                "Choose Project files to see genuine held-out feature contributions.")
+
+with training_tab:
+    st.subheader("XGBoost model training and validation")
+    if source != "Project files":
+        st.info("Training metadata is not part of the synthetic demo.")
+    else:
+        metadata = optional_json(project_model_dir / "metrics.json")
+        if metadata:
+            training_cols = st.columns(3)
+            training_cols[0].metric("Input features", str(metadata.get("n_features", "n/a")))
+            training_cols[1].metric("Optuna trials", str(metadata.get("optuna_trials", "n/a")))
+            best_cv = metadata.get("best_cv_mae_eur_mwh")
+            training_cols[2].metric("Best training CV MAE",
+                f"{float(best_cv):.2f} €/MWh" if best_cv is not None else "n/a")
+            for key, heading in (("train_dates", "Train"), ("validation_dates", "Validation"),
+                                 ("test_dates", "Test")):
+                if key in metadata:
+                    st.write(f"**{heading}:** {metadata[key]}")
+            result = figure_accuracy_comparison(metadata)
+            if result:
+                st.markdown("#### Validation and held-out test accuracy")
+                st.plotly_chart(result, use_container_width=True)
+                st.caption("The last-week price is a naïve FORECAST baseline "
+                           "(different from the BESS fixed-time dispatch benchmark). "
+                           "These saved metrics cover the full model evaluation windows.")
+            for k in ("validation_metrics", "test_metrics", "test_last_week_naive_metrics"):
+                if k in metadata:
+                    with st.expander(k.replace("_", " ").title()):
+                        st.json(metadata[k], expanded=True)
+            with st.expander("Saved XGBoost best hyperparameters"):
+                if "best_params" in metadata:
+                    st.json(metadata["best_params"], expanded=True)
+                else:
+                    st.caption("No best_params entry in metrics.json")
+        else:
+            st.info("No metrics.json found in the selected model folder.")
+        trials_path = project_model_dir / "optuna_trials.csv"
+        if trials_path.is_file():
+            st.markdown("#### Hyperparameter tuning with Optuna")
+            try:
+                trials_frame = read_csv(trials_path)
+                trials_figure = figure_optuna_trials(trials_frame)
+                if trials_figure:
+                    st.plotly_chart(trials_figure, use_container_width=True)
+                else:
+                    st.caption("Could not chart Optuna trials: need `number`, `value` columns.")
+                with st.expander("Raw Optuna trial results"):
+                    st.dataframe(trials_frame, hide_index=True, use_container_width=True)
+            except (OSError, ValueError) as exc:
+                st.warning(f"Could not load Optuna file: {exc}")
+        st.markdown("#### Data leakage controls / caveat")
+        st.markdown("Chronological train/validation/test partitions and "
+                    "pre-auction feature availability are separate requirements. "
+                    "The model script reports temporal splits, but historical "
+                    "as-of publication timestamps and revised data still need "
+                    "verification before claiming a fully point-in-time backtest.")
 
 with dispatch:
     st.subheader("Hourly optimisation decisions and settlement")
@@ -677,26 +1100,9 @@ upper bound; it is **not** a leakage-free investable strategy. No trading earns 
 - The oracle capture ratio can be negative if XGBoost loses money.
 """
     )
-    st.markdown("#### Optional model-driver visualisations")
-    plot_dirs = [ROOT / "outputs" / "shap", ROOT / "outputs" / "xgboost_optuna",
-                 ROOT / "outputs"]
-    patterns = ("*shap*summary*.png", "*shap*beeswarm*.png",
-                "*shap*bar*.png", "*feature*importance*.png")
-    images = []
-    for directory in plot_dirs:
-        if not directory.is_dir():
-            continue
-        for pattern in patterns:
-            images.extend(sorted(directory.glob(pattern)))
-    images = list(dict.fromkeys(images))[:4]
-    if images and source == "Project files":
-        for path in images:
-            st.image(str(path), caption=path.name, use_container_width=True)
-        st.caption("SHAP explains model predictions, not causal market mechanisms.")
-    else:
-        st.caption("If you save SHAP plots as PNGs under `outputs/shap/` "
-                   "(e.g. `shap_summary.png`), they will appear here. "
-                   "SHAP explanations are predictive associations, not causal proof.")
+    st.markdown("#### Model explainability")
+    st.caption("See the SHAP drivers tab for interactive Tree SHAP contribution "
+               "charts and saved SHAP plots from `outputs/xgboost_optuna/shap/`.")
 
 st.divider()
 st.caption("Energy Quant Portfolio · DE-LU day-ahead power market · "
